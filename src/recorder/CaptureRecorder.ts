@@ -19,6 +19,11 @@
  *    不可能污染新 take。
  * 7. 设备中断（轨道 ended 或 recorder error）只触发一次停止，并标注原因；
  *    有数据则保留成片，无数据则失败报错。
+ * 8. 瞬间标记（marker）只允许在 recording 态写入，时间取排除暂停的有效
+ *    时钟（与成片时长同一时钟）；同一毫秒的标记按会话内自增序号保序。
+ *    停止落定时标记与 Blob、时长一起冻结，并按冻结有效时长裁剪后随 take
+ *    交付；空 Blob 不生成 take，标记随之丢弃；标记与 chunk 一样受 session
+ *    守卫保护，旧会话迟到事件绝不可能把标记附到新 take。
  */
 
 export type RecorderStatus =
@@ -59,6 +64,36 @@ export class CaptureError extends Error {
   }
 }
 
+/** 导演在录制中打下的回看标记：时间基于排除暂停的有效录制时钟 */
+export interface TakeMarker {
+  /** 会话内唯一 id（会话内自增，跨 take 不复用） */
+  id: string
+  /** 短标签（已 trim，非空） */
+  label: string
+  /** 相对成片起点的有效时间（毫秒，不含暂停/等待/封装段） */
+  timeMs: number
+  /** 同毫秒内的创建次序（从 0 起，保证同毫秒保序） */
+  seq: number
+}
+
+/** 短标签上限（trim 后的字符数） */
+export const MAX_MARKER_LABEL_LENGTH = 40
+
+/** 打标被拒原因：UI 据此给出明确提示 */
+export type MarkerRejectCode =
+  | 'not-recording' // starting（等待权限）/ idle（未开拍或已结束）
+  | 'paused' // 已暂停：继续后才能标记
+  | 'stopping' // 正在收尾：标记已冻结
+  | 'empty-label' // 空白标签
+  | 'label-too-long' // 标签超长
+
+/** addMarker 的结局：成功带回冻结前的标记，失败带回明确原因 */
+export interface AddMarkerResult {
+  ok: boolean
+  marker?: TakeMarker
+  reason?: MarkerRejectCode
+}
+
 export interface Take {
   id: string
   /** 成片采用的采集模式（音频成片回放用 <audio>，其余用 <video>） */
@@ -72,6 +107,11 @@ export interface Take {
   createdAt: number
   /** 回放用对象 URL，由内核/上层负责 revoke */
   url: string
+  /**
+   * 停止落定时与成片一起冻结的瞬间标记，按 (timeMs, seq) 升序。
+   * 已按冻结有效时长裁剪（不含暂停段，时间戳不超过 durationMs）。
+   */
+  markers: TakeMarker[]
 }
 
 export interface RecorderDeps {
@@ -191,6 +231,11 @@ export interface RecorderCallbacks {
   onError: (error: CaptureError) => void
   /** 停止已落定（无论成片还是失败），UI 可借此刷新设备标签等 */
   onSettled: (reason: StopReason, error?: CaptureError) => void
+  /**
+   * 当前会话有效标记快照变化（新增 / 随停止、取消、失败、卸载而清空）。
+   * 只反映“进行中会话”的标记；take 冻结后的标记随 onTake 交付。
+   */
+  onLiveMarkersChange: (markers: readonly TakeMarker[]) => void
 }
 
 /** 开拍瞬间冻结的采集计划：授权等待期间任何外部操作都改不动它 */
@@ -228,12 +273,28 @@ interface ActiveSession {
   /** 停止原因附带的设备信息，用于无成片时的报错文案 */
   interruptionMessage: string
   trackListeners: Array<{ track: MediaStreamTrackLike; listener: () => void }>
+  /**
+   * 本会话录制中打下的标记，按创建次序保存。时间取 currentElapsed
+   * （排除暂停的有效时钟），与成片 durationMs 同源，因此暂停不会让标记漂移。
+   */
+  markers: TakeMarker[]
+  /** 会话内标记自增序号：同一毫秒多次标记靠它保序 */
+  markerSeq: number
 }
 
 const MODE_DEVICE_TEXT: Record<CaptureMode, string> = {
   av: '摄像头或麦克风',
   'video-only': '摄像头',
   'audio-only': '麦克风',
+}
+
+/** 各不可标记状态/非法标签的明确提示文案（UI 直接展示） */
+export const MARKER_REJECT_MESSAGE: Record<MarkerRejectCode, string> = {
+  'not-recording': '当前未在录制：只有录制中的瞬间才能打标。',
+  paused: '已暂停：暂停期间不能打标，请继续后再标记。',
+  stopping: '正在收尾：停止请求已发出，标记已冻结，不能再打标。',
+  'empty-label': '标记内容不能为空：请输入简短标签。',
+  'label-too-long': `标记过长：请控制在 ${MAX_MARKER_LABEL_LENGTH} 字以内。`,
 }
 
 function codecUnsupportedMessage(mode: CaptureMode): string {
@@ -411,6 +472,8 @@ export class CaptureRecorder {
       stopReason: 'user',
       interruptionMessage: '',
       trackListeners: [],
+      markers: [],
+      markerSeq: 0,
     }
     this.active = next
 
@@ -484,6 +547,44 @@ export class CaptureRecorder {
   }
 
   /**
+   * 给当前录制会话打下一个瞬间标记（短标签）。
+   *
+   * 仅 recording 态允许写入：等待权限（starting）、已暂停（paused）、
+   * 正在收尾（stopping）以及未开拍/已结束（idle）都给出明确拒绝原因，
+   * 不产生任何状态变化。时间使用与成片时长同源的“有效时钟”
+   * （currentElapsed：扣除全部暂停段），因此暂停不会让标记漂移；
+   * 同一毫秒的多次标记按会话内自增 seq 保留创建次序。
+   */
+  addMarker(rawLabel: string): AddMarkerResult {
+    if (this.disposed || !this.active || this.status !== 'recording') {
+      return { ok: false, reason: this.inactiveMarkerReason() }
+    }
+    const a = this.active
+    const label = rawLabel.trim()
+    if (label.length === 0) {
+      return { ok: false, reason: 'empty-label' }
+    }
+    if (label.length > MAX_MARKER_LABEL_LENGTH) {
+      return { ok: false, reason: 'label-too-long' }
+    }
+    const marker: TakeMarker = {
+      id: `m${a.session}-${a.markerSeq + 1}`,
+      label,
+      timeMs: this.currentElapsed(a),
+      seq: a.markerSeq,
+    }
+    a.markerSeq += 1
+    a.markers.push(marker)
+    this.emitLiveMarkers(a)
+    return { ok: true, marker }
+  }
+
+  /** 当前会话进行中标记的只读快照（无进行中会话时为空） */
+  getLiveMarkers(): readonly TakeMarker[] {
+    return this.active ? this.active.markers.slice() : []
+  }
+
+  /**
    * 用户停止；重复调用安全，停止中的再次调用无效。
    * starting（授权弹窗未决）时语义为“取消本次开拍”：不产生任何成片、
    * 不释放任何轨道（流尚未拿到），直接回 idle 并令 session 失效；
@@ -508,12 +609,34 @@ export class CaptureRecorder {
     // 授权未决时卸载：作废 session，迟到的授权结果只会释放其流
     if (!this.active && this.plan) this.plan = null
     const a = this.active
-    if (a) this.teardownSession(a)
+    if (a) {
+      this.teardownSession(a)
+      // 卸载不产生 take：进行中标记随会话一起丢弃，不附到任何成片
+      this.callbacks.onLiveMarkersChange([])
+    }
     this.active = null
     if (this.status !== 'idle') this.setStatus('idle')
   }
 
   // ---- 内部 ----
+
+  /** 非 recording 态下打标的拒绝原因（dispose 后按已结束处理） */
+  private inactiveMarkerReason(): MarkerRejectCode {
+    switch (this.status) {
+      case 'paused':
+        return 'paused'
+      case 'stopping':
+        return 'stopping'
+      // starting（等待权限）与 idle（未开拍/已结束）统一为“未在录制”
+      default:
+        return 'not-recording'
+    }
+  }
+
+  /** 广播进行中标记的不可变快照（slice 防止外部改写会话内数组） */
+  private emitLiveMarkers(a: ActiveSession): void {
+    this.callbacks.onLiveMarkersChange(a.markers.slice())
+  }
 
   /** 取消等待授权的开拍：确定结局是“取消”——无成片、无错误、回 idle */
   private cancelStarting(): void {
@@ -521,6 +644,8 @@ export class CaptureRecorder {
     this.sessionCounter++
     this.plan = null
     this.setStatus('idle')
+    // 取消不产生 take：进行中标记视图（理论上为空）也一并清空
+    this.callbacks.onLiveMarkersChange([])
   }
 
   private requestStop(a: ActiveSession, reason: StopReason): void {
@@ -613,10 +738,18 @@ export class CaptureRecorder {
     const chunks = a.chunks
     const interruptedMessage = a.interruptionMessage
     const forced = a.forcedByTimer
+    // 标记与时长在同一落定时刻冻结：以冻结有效时长裁剪
+    // （等于裁剪边界的标记保留），再按 (timeMs, seq) 稳定排序。
+    // 正常时钟下单调推进不会产生越界标记；裁剪是对时钟回拨等异常的防御。
+    const markers = a.markers
+      .filter((m) => m.timeMs <= durationMs)
+      .sort((x, y) => x.timeMs - y.timeMs || x.seq - y.seq)
 
     this.teardownSession(a)
     this.active = null
     this.setStatus('idle')
+    // 会话结束：进行中标记视图清空；冻结副本已随 take（或随失败丢弃）
+    this.callbacks.onLiveMarkersChange([])
 
     if (chunks.length === 0) {
       const error = forced
@@ -648,6 +781,7 @@ export class CaptureRecorder {
       reason,
       createdAt: this.deps.now(),
       url: this.deps.createObjectURL(blob),
+      markers,
     }
     this.callbacks.onTake(take)
     this.callbacks.onSettled(reason)

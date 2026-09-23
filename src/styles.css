@@ -284,6 +284,144 @@ select:disabled {
   line-height: 1.5;
 }
 
+.marker-row {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin: 0;
+  padding: 10px 12px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.marker-row legend {
+  padding: 0 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.marker-compose {
+  display: flex;
+  gap: 8px;
+}
+
+.marker-input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.marker-input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.btn-marker {
+  border-color: var(--warn);
+  color: var(--warn);
+  white-space: nowrap;
+}
+
+.marker-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.marker-notice {
+  margin: 0;
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.live-markers {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 132px;
+  overflow-y: auto;
+}
+
+.live-marker {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+  background: var(--panel-2);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+
+.live-marker time {
+  color: var(--warn);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.live-marker span {
+  color: var(--text);
+  word-break: break-word;
+}
+
+.marker-list {
+  border-top: 1px solid var(--border);
+  padding: 8px 10px 4px;
+}
+
+.marker-list-title {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.marker-list ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.marker-jump-btn {
+  width: 100%;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  text-align: left;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.marker-jump-btn:hover {
+  border-color: var(--warn);
+}
+
+.marker-jump-btn time {
+  color: var(--warn);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.marker-label-text {
+  word-break: break-word;
+}
+
 .takes {
   margin-top: 28px;
 }

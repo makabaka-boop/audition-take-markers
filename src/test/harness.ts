@@ -5,6 +5,7 @@ import {
   type MediaRecorderLikeCtor,
   type StopReason,
   type Take,
+  type TakeMarker,
 } from '../recorder/CaptureRecorder'
 import {
   controllableGetUserMedia,
@@ -23,6 +24,13 @@ export interface Harness {
   statuses: string[]
   settlements: Array<{ reason: StopReason; error?: CaptureError }>
   urls: Map<string, Blob>
+  /**
+   * onLiveMarkersChange 每次广播的快照序列：新增时为新数组、
+   * 停止/取消/失败/卸载时为空数组。用于验证“会话结束即清空、不串会话”。
+   */
+  liveMarkerSnapshots: TakeMarker[][]
+  /** 最近一次进行中标记广播快照 */
+  liveMarkers: () => TakeMarker[]
   /** 虚拟时钟：nowMs 读写虚拟时间，advance 推进并触发兜底定时器 */
   clock: VirtualClock
   /** 手动授权模式下的取流控制器 */
@@ -48,6 +56,7 @@ export function makeHarness(getUserMediaOpts?: {
   const errors: CaptureError[] = []
   const statuses: string[] = []
   const settlements: Harness['settlements'] = []
+  const liveMarkerSnapshots: TakeMarker[][] = []
   const urls = new Map<string, Blob>()
   const clock = createVirtualClock(1000)
   const calls: MediaStreamConstraints[] = []
@@ -60,6 +69,11 @@ export function makeHarness(getUserMediaOpts?: {
       onError: (e) => errors.push(e),
       onSettled: (reason, error) =>
         settlements.push({ reason, error }),
+      onLiveMarkersChange: (markers) => {
+        // 保存快照内容而非引用：内核每次都传新数组，这里再拷一层避免
+        // 后续会话复用同一引用导致历史快照被改写
+        liveMarkerSnapshots.push(markers.slice())
+      },
     },
     {
       MediaRecorder:
@@ -96,6 +110,9 @@ export function makeHarness(getUserMediaOpts?: {
     errors,
     statuses,
     settlements,
+    liveMarkerSnapshots,
+    liveMarkers: () =>
+      liveMarkerSnapshots[liveMarkerSnapshots.length - 1] ?? [],
     urls,
     clock,
     media,

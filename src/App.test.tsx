@@ -2,6 +2,7 @@ import { describe, expect, it, beforeEach, beforeAll, afterAll, afterEach, vi } 
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import App from './App'
 import { FakeMediaRecorder, FakeTrack } from './test/fakes'
+import { STOP_FINALIZE_GRACE_MS } from './recorder/CaptureRecorder'
 
 /**
  * UI 层测试：下载按钮使用“当前所选交付版”；三种模式的切换/禁用、
@@ -477,5 +478,429 @@ describe('授权未决时取消（UI）', () => {
       await Promise.resolve()
     })
     expect(document.querySelectorAll('video.take-video')).toHaveLength(1)
+  })
+})
+
+describe('瞬间标记（页面）', () => {
+  beforeAll(() => {
+    vi.spyOn(HTMLMediaElement.prototype, 'play').mockImplementation(() =>
+      Promise.resolve(),
+    )
+    vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(
+      () => undefined,
+    )
+    vi.spyOn(HTMLMediaElement.prototype, 'load').mockImplementation(
+      () => undefined,
+    )
+  })
+
+  afterAll(() => {
+    vi.restoreAllMocks()
+  })
+
+  beforeEach(() => {
+    FakeMediaRecorder.reset()
+    installGlobals()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  /** 输入标签并点击“打标记” */
+  function mark(label: string) {
+    fireEvent.change(screen.getByLabelText('瞬间标记标签'), {
+      target: { value: label },
+    })
+    fireEvent.click(screen.getByRole('button', { name: '打标记' }))
+  }
+
+  /** 当前成片卡片（倒序，最新一张在最前）的播放器 */
+  function takeVideo(index = 0): HTMLVideoElement {
+    const els = Array.from(
+      document.querySelectorAll<HTMLVideoElement>('video.take-video'),
+    )
+    return els[index] as HTMLVideoElement
+  }
+
+  it('录制中可打标并即时显示；非录制状态按钮禁用且给出明确不可标记提示', async () => {
+    vi.useFakeTimers()
+    render(<App />)
+    await act(async () => {
+      vi.advanceTimersByTime(0)
+      await Promise.resolve()
+    })
+
+    // idle：未开拍，打标禁用，提示“当前未在录制”
+    const markerBtn = screen.getByRole('button', { name: '打标记' })
+    const markerInput = screen.getByLabelText('瞬间标记标签')
+    expect((markerBtn as HTMLButtonElement).disabled).toBe(true)
+    expect((markerInput as HTMLInputElement).disabled).toBe(true)
+    expect(screen.getByTestId('marker-blocked-hint').textContent).toContain(
+      '当前未在录制',
+    )
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '开始 take' }))
+      await Promise.resolve()
+    })
+    expect((markerBtn as HTMLButtonElement).disabled).toBe(false)
+
+    // 录制 1200ms 后打标
+    await act(async () => {
+      vi.advanceTimersByTime(1200)
+    })
+    act(() => mark('第一次笑场'))
+    expect(
+      Array.from(document.querySelectorAll('.live-marker')).some((li) =>
+        li.textContent?.includes('笑场'),
+      ),
+    ).toBe(true)
+
+    // 暂停：打标禁用 + 明确暂停提示
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: '暂停' }))
+      vi.advanceTimersByTime(9000) // 暂停 9 秒
+    })
+    expect((markerBtn as HTMLButtonElement).disabled).toBe(true)
+    expect(screen.getByTestId('marker-blocked-hint').textContent).toContain(
+      '已暂停',
+    )
+
+    // 继续 300ms 后再打标，时间不应包含暂停段
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: '继续' }))
+      vi.advanceTimersByTime(300)
+    })
+    act(() => mark('继续后的亮点'))
+    const liveTexts = Array.from(
+      document.querySelectorAll('.live-marker'),
+    ).map((li) => li.textContent)
+    expect(liveTexts.some((t) => t?.includes('00:01.2'))).toBe(true)
+    expect(liveTexts.some((t) => t?.includes('00:01.5'))).toBe(true)
+    expect(liveTexts.some((t) => t?.includes('00:10'))).toBe(false)
+
+    // 停止（收尾态短暂存在也不允许打标），落定后回到“当前未在录制”
+    const rec = FakeMediaRecorder.instances[
+      FakeMediaRecorder.instances.length - 1
+    ]
+    act(() => {
+      rec.emitData(['clip'])
+      fireEvent.click(screen.getByRole('button', { name: '停止' }))
+    })
+    expect(screen.getByTestId('marker-blocked-hint').textContent).toContain(
+      '正在收尾',
+    )
+    expect((screen.getByRole('button', { name: '打标记' }) as HTMLButtonElement).disabled).toBe(true)
+    await act(async () => {
+      rec.emitStop()
+      vi.advanceTimersByTime(STOP_FINALIZE_GRACE_MS + 10)
+      await Promise.resolve()
+    })
+    expect(screen.getByTestId('marker-blocked-hint').textContent).toContain(
+      '当前未在录制',
+    )
+    // 进行中列表消失，标记进入成片卡片
+    expect(document.querySelectorAll('.live-marker')).toHaveLength(0)
+  })
+
+  it('空白标签被明确拒绝（不新增标记、不影响录制）', async () => {
+    vi.useFakeTimers()
+    render(<App />)
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '开始 take' }))
+      await Promise.resolve()
+    })
+    act(() => {
+      fireEvent.change(screen.getByLabelText('瞬间标记标签'), {
+        target: { value: '   ' },
+      })
+      fireEvent.click(screen.getByRole('button', { name: '打标记' }))
+    })
+    expect(screen.getByRole('alert').textContent).toContain('不能为空')
+    expect(document.querySelectorAll('.live-marker')).toHaveLength(0)
+  })
+
+  it('停止后标记列在回放卡片中：点击跳转把播放器 currentTime 定位到标记秒点（与播放器时间同步）', async () => {
+    vi.useFakeTimers()
+    render(<App />)
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '开始 take' }))
+      await Promise.resolve()
+    })
+
+    await act(async () => {
+      vi.advanceTimersByTime(2000)
+    })
+    act(() => mark('两秒处'))
+    await act(async () => {
+      vi.advanceTimersByTime(2500)
+    })
+    act(() => mark('四点五秒处'))
+
+    const rec = FakeMediaRecorder.instances[
+      FakeMediaRecorder.instances.length - 1
+    ]
+    await act(async () => {
+      rec.emitData(['video-bytes'])
+      fireEvent.click(screen.getByRole('button', { name: '停止' }))
+      rec.emitStop()
+      vi.advanceTimersByTime(STOP_FINALIZE_GRACE_MS + 10)
+      await Promise.resolve()
+    })
+
+    const video = takeVideo(0)
+    // 卡片中的跳转按钮，时间标签与录制有效时长一致
+    const jump2 = screen.getByRole('button', {
+      name: /跳转到 00:02.0 的标记：两秒处/,
+    })
+    const jump45 = screen.getByRole('button', {
+      name: '跳转到 00:04.5 的标记：四点五秒处',
+    })
+    expect(jump2).toBeTruthy()
+    expect(jump45).toBeTruthy()
+
+    // 点击跳转：播放器 currentTime 精确同步到标记的有效时间（秒）
+    act(() => {
+      fireEvent.click(jump45)
+    })
+    expect(video.currentTime).toBeCloseTo(4.5, 5)
+
+    act(() => {
+      fireEvent.click(jump2)
+    })
+    expect(video.currentTime).toBeCloseTo(2.0, 5)
+  })
+
+  it('同一毫秒两个标记：回放列表都保留，按创建次序排列且各自可跳转', async () => {
+    vi.useFakeTimers()
+    render(<App />)
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '开始 take' }))
+      await Promise.resolve()
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(3000)
+    })
+    act(() => mark('同毫秒甲'))
+    act(() => mark('同毫秒乙'))
+
+    const rec = FakeMediaRecorder.instances[
+      FakeMediaRecorder.instances.length - 1
+    ]
+    await act(async () => {
+      rec.emitData(['same-ms'])
+      fireEvent.click(screen.getByRole('button', { name: '停止' }))
+      rec.emitStop()
+      vi.advanceTimersByTime(STOP_FINALIZE_GRACE_MS + 10)
+      await Promise.resolve()
+    })
+
+    const video = takeVideo(0)
+    const card = video.closest('.take-card') as HTMLElement
+    const labels = Array.from(
+      card.querySelectorAll('.marker-jump-btn .marker-label-text'),
+    ).map((el) => el.textContent)
+    expect(labels).toEqual(['同毫秒甲', '同毫秒乙'])
+    const times = Array.from(card.querySelectorAll('.marker-jump-btn time')).map(
+      (el) => el.textContent,
+    )
+    expect(times).toEqual(['00:03.0', '00:03.0'])
+
+    act(() => {
+      fireEvent.click(
+        screen.getByRole('button', { name: /跳转到 00:03.0 的标记：同毫秒乙/ }),
+      )
+    })
+    expect(video.currentTime).toBeCloseTo(3.0, 5)
+  })
+
+  it('暂停边界：暂停期间不计入标记时间，恢复后继续累积；成片时长与标记时间一致', async () => {
+    vi.useFakeTimers()
+    render(<App />)
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '开始 take' }))
+      await Promise.resolve()
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(1000)
+    })
+    act(() => mark('暂停前'))
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: '暂停' }))
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(8000)
+    })
+    act(() => {
+      fireEvent.click(screen.getByRole('button', { name: '继续' }))
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(500)
+    })
+    act(() => mark('继续后'))
+
+    const rec = FakeMediaRecorder.instances[
+      FakeMediaRecorder.instances.length - 1
+    ]
+    await act(async () => {
+      rec.emitData(['pause-edge-ui'])
+      fireEvent.click(screen.getByRole('button', { name: '停止' }))
+      rec.emitStop()
+      vi.advanceTimersByTime(STOP_FINALIZE_GRACE_MS + 10)
+      await Promise.resolve()
+    })
+
+    const video = takeVideo(0)
+    act(() => {
+      fireEvent.click(
+        screen.getByRole('button', { name: /跳转到 00:01.5 的标记：继续后/ }),
+      )
+    })
+    expect(video.currentTime).toBeCloseTo(1.5, 5)
+    // 时长同样排除了暂停段（1.0 + 0.5 = 1.5s）
+    const info = (video.closest('.take-card') as HTMLElement).querySelector(
+      '.take-info',
+    )?.textContent
+    expect(info).toContain('00:02')
+  })
+
+  it('切换 take 不串标记：两个成片各自只显示并跳转到自己的标记', async () => {
+    vi.useFakeTimers()
+    render(<App />)
+
+    // take A：在 1s 打标
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '开始 take' }))
+      await Promise.resolve()
+      vi.advanceTimersByTime(1000)
+    })
+    act(() => mark('A 的标记'))
+    let rec = FakeMediaRecorder.instances[
+      FakeMediaRecorder.instances.length - 1
+    ]
+    await act(async () => {
+      rec.emitData(['a'])
+      fireEvent.click(screen.getByRole('button', { name: '停止' }))
+      rec.emitStop()
+      vi.advanceTimersByTime(STOP_FINALIZE_GRACE_MS + 10)
+      await Promise.resolve()
+    })
+
+    // take B：在 4s 打标（不同标签、不同时间）
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '开始 take' }))
+      await Promise.resolve()
+      vi.advanceTimersByTime(4000)
+    })
+    act(() => mark('B 的标记'))
+    rec = FakeMediaRecorder.instances[
+      FakeMediaRecorder.instances.length - 1
+    ]
+    await act(async () => {
+      rec.emitData(['b'])
+      fireEvent.click(screen.getByRole('button', { name: '停止' }))
+      rec.emitStop()
+      vi.advanceTimersByTime(STOP_FINALIZE_GRACE_MS + 10)
+      await Promise.resolve()
+    })
+
+    // 倒序渲染：卡片 0 = B（最新），卡片 1 = A
+    const videoB = takeVideo(0)
+    const videoA = takeVideo(1)
+    const cardB = videoB.closest('.take-card') as HTMLElement
+    const cardA = videoA.closest('.take-card') as HTMLElement
+
+    expect(
+      cardB.querySelector('.marker-label-text')?.textContent,
+    ).toBe('B 的标记')
+    expect(
+      cardA.querySelector('.marker-label-text')?.textContent,
+    ).toBe('A 的标记')
+
+    act(() => {
+      fireEvent.click(
+        cardA.querySelector('.marker-jump-btn') as HTMLButtonElement,
+      )
+    })
+    expect(videoA.currentTime).toBeCloseTo(1.0, 5)
+    expect(videoB.currentTime).toBe(0) // B 的播放器未被联动
+
+    act(() => {
+      fireEvent.click(
+        cardB.querySelector('.marker-jump-btn') as HTMLButtonElement,
+      )
+    })
+    expect(videoB.currentTime).toBeCloseTo(4.0, 5)
+    expect(videoA.currentTime).toBeCloseTo(1.0, 5) // A 停在原处
+  })
+
+  it('设备中断后重录：中断成片保留中断前标记，重录成片不继承旧标记', async () => {
+    render(<App />)
+    await waitFor(() =>
+      expect(
+        (screen.getByRole('button', { name: '开始 take' }) as HTMLButtonElement)
+          .disabled,
+      ).toBe(false),
+    )
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '开始 take' }))
+    })
+    act(() => mark('中断瞬间'))
+    // 模拟拔掉摄像头：轨道 ended 触发 device-interrupted 自动停止
+    const firstRecorder = FakeMediaRecorder.instances[
+      FakeMediaRecorder.instances.length - 1
+    ]
+    await act(async () => {
+      firstRecorder.emitData(['before-pull'])
+      // installGlobals 的 take 没暴露轨道，这里用 recorder error 走同一中断路径
+      firstRecorder.emitError({ name: 'UnknownError', message: 'device gone' })
+      firstRecorder.emitData(['tail'])
+      firstRecorder.emitStop()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    // 中断成片带标记与“设备中断”标注
+    const videosAfterFirst = document.querySelectorAll('video.take-video')
+    expect(videosAfterFirst).toHaveLength(1)
+    const card1 = videosAfterFirst[0].closest('.take-card') as HTMLElement
+    expect(
+      card1.querySelector('.marker-label-text')?.textContent,
+    ).toBe('中断瞬间')
+    expect(card1.querySelector('.reason-device-interrupted')).toBeTruthy()
+    // 中断落定后进行中标记区清空
+    expect(document.querySelectorAll('.live-marker')).toHaveLength(0)
+
+    // 重录一条：打新标记后停止
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '开始 take' }))
+    })
+    act(() => mark('重录瞬间'))
+    const secondRecorder = FakeMediaRecorder.instances[
+      FakeMediaRecorder.instances.length - 1
+    ]
+    await act(async () => {
+      secondRecorder.emitData(['retry'])
+      fireEvent.click(screen.getByRole('button', { name: '停止' }))
+      secondRecorder.emitStop()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    const cards = Array.from(document.querySelectorAll('.take-card'))
+    expect(cards).toHaveLength(2)
+    // 倒序：0 = 重录，1 = 中断
+    expect(
+      cards[0].querySelector('.marker-label-text')?.textContent,
+    ).toBe('重录瞬间')
+    expect(
+      cards[1].querySelector('.marker-label-text')?.textContent,
+    ).toBe('中断瞬间')
+    // 重录卡片只有自己的 1 个标记按钮
+    expect(cards[0].querySelectorAll('.marker-jump-btn')).toHaveLength(1)
+    expect(cards[1].querySelectorAll('.marker-jump-btn')).toHaveLength(1)
   })
 })

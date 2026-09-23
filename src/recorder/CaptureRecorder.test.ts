@@ -1,10 +1,13 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest'
 import {
   CaptureRecorder,
+  MARKER_REJECT_MESSAGE,
+  MAX_MARKER_LABEL_LENGTH,
   MIME_CANDIDATES,
   MODE_MIME_CANDIDATES,
   STOP_FINALIZE_GRACE_MS,
   pickSupportedMimeType,
+  type AddMarkerResult,
   type CaptureMode,
   type MediaRecorderLikeCtor,
   type MediaStreamLike,
@@ -318,6 +321,395 @@ describe('设备中断（轨道 ended / recorder error）', () => {
   })
 })
 
+describe('瞬间标记：写入守卫与有效时钟', () => {
+  it('录制中打标：时间取排除暂停的有效时钟，标签被 trim，按创建次序返回', async () => {
+    const h = makeHarness()
+    const rec = await startTake(h) // t0 = 1000
+    rec.emitData(['a'])
+
+    h.clock.now = 1500 // 有效时长 500
+    const r1 = h.recorder.addMarker('  精彩表情  ')
+    expect(r1.ok).toBe(true)
+    expect(r1.marker?.timeMs).toBe(500)
+    expect(r1.marker?.label).toBe('精彩表情')
+    expect(r1.marker?.seq).toBe(0)
+
+    // 暂停 5000ms 后再打标：有效时钟不增长（暂停期间本身禁止打标，
+    // 这里验证继续后的标记时间不包含暂停段）
+    h.clock.now = 2000
+    h.recorder.pause()
+    h.clock.now = 7000
+    h.recorder.resume() // startedAt=7000，accumulated=1000
+    h.clock.now = 7500 // 继续后又录 500，有效时长 1500
+    const r2 = h.recorder.addMarker('收尾')
+    expect(r2.ok).toBe(true)
+    expect(r2.marker?.timeMs).toBe(1500)
+    expect(r2.marker?.seq).toBe(1)
+    expect(r2.marker?.id).not.toBe(r1.marker?.id)
+  })
+
+  it('同一毫秒的多次标记：timeMs 相同，按创建次序（seq）保序', async () => {
+    const h = makeHarness()
+    const rec = await startTake(h) // t0 = 1000
+
+    h.clock.now = 2500
+    const results: AddMarkerResult[] = []
+    for (const label of ['第一', '第二', '第三']) {
+      results.push(h.recorder.addMarker(label))
+    }
+    expect(results.every((r) => r.ok)).toBe(true)
+    expect(results.map((r) => r.marker?.timeMs)).toEqual([1500, 1500, 1500])
+    expect(results.map((r) => r.marker?.seq)).toEqual([0, 1, 2])
+
+    const live = h.liveMarkers()
+    expect(live.map((m) => m.label)).toEqual(['第一', '第二', '第三'])
+
+    // 停止冻结后同毫秒次序保持（需要非空 chunk 才会生成 take）
+    rec.emitData(['x'])
+    h.recorder.stop()
+    h.lastRecorder().emitStop()
+    expect(h.takes[0].markers.map((m) => [m.timeMs, m.seq])).toEqual([
+      [1500, 0],
+      [1500, 1],
+      [1500, 2],
+    ])
+  })
+
+  it('新增标记通过 onLiveMarkersChange 推送不可变快照，停止落定时清空进行中列表', async () => {
+    const h = makeHarness()
+    const rec = await startTake(h)
+    h.clock.now = 1300
+    h.recorder.addMarker('m-a')
+    h.clock.now = 1600
+    h.recorder.addMarker('m-b')
+    rec.emitData(['chunk'])
+    const live = h.liveMarkers()
+    expect(live.map((m) => m.label)).toEqual(['m-a', 'm-b'])
+    // 广播给调用方的是副本：与内核内部数组不是同一引用，调用方改不到内核
+    const beforeStopSnapshots = h.liveMarkerSnapshots.length
+    expect(beforeStopSnapshots).toBe(2)
+    expect(h.recorder.getLiveMarkers()).not.toBe(h.liveMarkerSnapshots[1])
+
+    h.recorder.stop()
+    h.lastRecorder().emitStop()
+    expect(h.liveMarkers()).toEqual([])
+    const snaps = h.liveMarkerSnapshots
+    // 广播序列：新增、新增、落定清空
+    expect(snaps.map((s) => s.map((m) => m.label))).toEqual([
+      ['m-a'],
+      ['m-a', 'm-b'],
+      [],
+    ])
+    // 冻结的副本随 take，且是独立数组
+    expect(h.takes[0].markers.map((m) => m.label)).toEqual(['m-a', 'm-b'])
+  })
+
+  it('非 recording 态一律拒绝并给出明确原因，不产生标记也不推送快照', async () => {
+    const h = makeHarness({ manualPermissions: true })
+
+    // idle：未开拍
+    expect(h.recorder.addMarker('x')).toEqual({
+      ok: false,
+      reason: 'not-recording',
+    })
+
+    // starting：等待权限
+    h.recorder.start({ mode: 'av' })
+    expect(h.recorder.getStatus()).toBe('starting')
+    expect(h.recorder.addMarker('x').reason).toBe('not-recording')
+
+    // 取消开拍后仍是 idle 拒绝；迟到的 grant 被丢弃
+    h.recorder.stop()
+    expect(h.recorder.addMarker('x').reason).toBe('not-recording')
+    h.media.grant()
+    await h.flush()
+    expect(h.recorder.getStatus()).toBe('idle')
+    expect(h.takes).toHaveLength(0)
+
+    // 重新开拍并放行：recording 允许
+    h.recorder.start({ mode: 'av' })
+    h.media.grant()
+    await h.flush()
+    expect(h.recorder.getStatus()).toBe('recording')
+    h.lastRecorder().emitData(['chunk'])
+    expect(h.recorder.addMarker('x').ok).toBe(true)
+
+    // paused：已暂停
+    h.recorder.pause()
+    expect(h.recorder.addMarker('y').reason).toBe('paused')
+
+    // stopping：正在收尾（标记已冻结）
+    h.recorder.stop()
+    expect(h.recorder.getStatus()).toBe('stopping')
+    expect(h.recorder.addMarker('z').reason).toBe('stopping')
+
+    // idle：已结束（落定后）
+    h.lastRecorder().emitStop()
+    expect(h.recorder.getStatus()).toBe('idle')
+    expect(h.recorder.addMarker('w').reason).toBe('not-recording')
+
+    // 唯一被接受的标记来自 recording 阶段
+    expect(h.takes[0].markers.map((m) => m.label)).toEqual(['x'])
+  })
+
+  it('空白标签与超长标签被拒，且错误文案明确', async () => {
+    const h = makeHarness()
+    await startTake(h)
+
+    expect(h.recorder.addMarker('   ').reason).toBe('empty-label')
+    expect(h.recorder.addMarker('').reason).toBe('empty-label')
+    const longLabel = '字'.repeat(MAX_MARKER_LABEL_LENGTH + 1)
+    expect(h.recorder.addMarker(longLabel).reason).toBe('label-too-long')
+    expect(MARKER_REJECT_MESSAGE['empty-label']).toContain('不能为空')
+    expect(MARKER_REJECT_MESSAGE['label-too-long']).toContain(
+      String(MAX_MARKER_LABEL_LENGTH),
+    )
+    expect(h.liveMarkers()).toEqual([])
+
+    // 边界值（恰好上限）允许
+    const okLabel = '字'.repeat(MAX_MARKER_LABEL_LENGTH)
+    expect(h.recorder.addMarker(okLabel).ok).toBe(true)
+  })
+
+  it('多段录制后停止：所有标记的时间均为有效时间，排序与时长一致', async () => {
+    const h = makeHarness()
+    const rec = await startTake(h) // 1000
+    rec.emitData(['seg'])
+    h.clock.advance(1000) // 有效 1000
+    h.recorder.addMarker('段一')
+    h.recorder.pause()
+    h.clock.advance(4000) // 暂停 4000（排除）
+    h.recorder.resume()
+    h.clock.advance(2000) // 有效 3000
+    h.recorder.addMarker('段二')
+    h.recorder.pause()
+    h.clock.advance(6000) // 暂停二 6000（排除）
+
+    // 暂停态停止：标记冻结在暂停前的有效时钟
+    h.recorder.stop()
+    h.clock.advance(2000) // 封装等待（排除）
+    rec.emitStop()
+
+    const take = h.takes[0]
+    expect(take.durationMs).toBe(3000)
+    expect(take.markers.map((m) => [m.label, m.timeMs])).toEqual([
+      ['段一', 1000],
+      ['段二', 3000],
+    ])
+    // 每个标记都落在成片有效时长内
+    expect(take.markers.every((m) => m.timeMs <= take.durationMs)).toBe(true)
+  })
+})
+
+describe('瞬间标记：停止冻结 / 裁剪 / 空 Blob / 会话隔离', () => {
+  it('停止成功后标记随 take 冻结：乱序 dataavailable 不影响标记', async () => {
+    const h = makeHarness()
+    const rec = await startTake(h) // 1000
+    h.clock.now = 1200
+    h.recorder.addMarker('早')
+    rec.emitData(['a'])
+    h.clock.now = 1800
+    h.recorder.addMarker('晚')
+
+    h.recorder.stop()
+    // stop 事件之前尾段晚到、dataavailable 与 stop 交错：标记不变
+    rec.emitData(['tail'])
+    rec.emitStop()
+    rec.emitData(['after']) // stop 后的陈旧 chunk 丢弃
+
+    const take = h.takes[0]
+    expect(take.markers.map((m) => [m.label, m.timeMs])).toEqual([
+      ['早', 200],
+      ['晚', 800],
+    ])
+    expect(await readBlob(take.blob)).toBe('a\ntail\n')
+  })
+
+  it('停止超时（兜底强制收尾）：按冻结有效时长保留标记', async () => {
+    const h = makeHarness()
+    const rec = await startTake(h) // 1000
+    h.clock.advance(700)
+    h.recorder.addMarker('冻结点前')
+    rec.emitData(['data'])
+    h.recorder.stop() // 有效时长冻结在 700
+
+    // 编码器始终不发 stop：兜底窗口后强制落定
+    h.clock.advance(STOP_FINALIZE_GRACE_MS + 5000)
+    expect(h.recorder.getStatus()).toBe('idle')
+    const take = h.takes[0]
+    expect(take.durationMs).toBe(700)
+    expect(take.markers.map((m) => m.label)).toEqual(['冻结点前'])
+    expect(take.markers[0]?.timeMs).toBe(700)
+  })
+
+  it('设备中断：标记按时长冻结裁剪，原因保留 device-interrupted', async () => {
+    const h = makeHarness()
+    const rec = await startTake(h) // 1000
+    h.clock.advance(400)
+    h.recorder.addMarker('中断前')
+    rec.emitData(['pre'])
+    h.sessions[0].tracks[0].emitEnded() // 中断：时长冻结在 400
+    expect(h.recorder.getStatus()).toBe('stopping')
+
+    rec.emitData(['tail'])
+    rec.emitStop()
+    const take = h.takes[0]
+    expect(take.reason).toBe('device-interrupted')
+    expect(take.durationMs).toBe(400)
+    expect(take.markers.map((m) => m.label)).toEqual(['中断前'])
+    expect(take.markers[0]?.timeMs).toBe(400)
+  })
+
+  it('防御：冻结后时间戳越过冻结有效时长的标记被裁剪（边界值保留）', async () => {
+    const h = makeHarness()
+    const rec = await startTake(h) // 1000
+    h.clock.now = 1500
+    h.recorder.addMarker('正常点') // 500
+
+    // 模拟设备中断后的时钟回拨：中断时刻早于最后一个标记的时钟读数。
+    // 真实 UA 时钟单调不会发生；此用例锁定“按冻结有效时长裁剪”的不变量。
+    h.clock.now = 1200
+    rec.emitData(['d'])
+    h.sessions[0].tracks[0].emitEnded() // frozenDuration = 200
+    rec.emitStop()
+
+    const take = h.takes[0]
+    expect(take.durationMs).toBe(200)
+    expect(take.markers).toEqual([]) // 500 > 200，被裁剪
+  })
+
+  it('边界：时间戳恰好等于冻结时长的标记保留', async () => {
+    const h = makeHarness()
+    const rec = await startTake(h) // 1000
+    h.clock.now = 1600
+    h.recorder.addMarker('恰好') // 600
+    rec.emitData(['d'])
+    h.recorder.stop() // frozenDuration = 600
+    rec.emitStop()
+    expect(h.takes[0].durationMs).toBe(600)
+    expect(h.takes[0].markers.map((m) => m.label)).toEqual(['恰好'])
+  })
+
+  it('空 Blob（仅零字节数据）不生成带标记 take：标记随失败丢弃', async () => {
+    const h = makeHarness()
+    const rec = await startTake(h)
+    h.clock.now = 1200
+    h.recorder.addMarker('白打了')
+    rec.emitEmptyData()
+    rec.emitEmptyData()
+    h.recorder.stop()
+    rec.emitStop()
+
+    expect(h.takes).toHaveLength(0)
+    expect(h.errors[0]?.code).toBe('empty-take')
+    // 没有 take 可附着；进行中列表已清空，不残留
+    expect(h.liveMarkers()).toEqual([])
+  })
+
+  it('无数据设备中断：标记不附着任何成片，进行中列表清空', async () => {
+    const h = makeHarness()
+    const rec = await startTake(h)
+    h.recorder.addMarker('孤独的标记')
+    h.sessions[0].tracks[0].emitEnded()
+    rec.emitStop()
+    expect(h.takes).toHaveLength(0)
+    expect(h.errors[0]?.code).toBe('empty-take')
+    expect(h.liveMarkers()).toEqual([])
+  })
+
+  it('旧会话迟到的事件绝不能把标记附到新 take', async () => {
+    const h = makeHarness()
+    const rec1 = await startTake(h)
+    h.clock.now = 1100
+    h.recorder.addMarker('旧标记')
+    rec1.emitData(['one'])
+    h.recorder.stop()
+    rec1.emitStop()
+    expect(h.takes[0].markers.map((m) => m.label)).toEqual(['旧标记'])
+
+    // 新 take：onLiveMarkersChange 已在落定时清空
+    const rec2 = await startTake(h)
+    expect(h.liveMarkers()).toEqual([])
+    h.clock.now = 5000
+    h.recorder.addMarker('新标记')
+    // 旧 recorder 在新会话里迟到事件（含 dataavailable/stop/error）：
+    // 被 session 守卫丢弃，新会话标记与成片都不受影响
+    rec1.emitData(['ghost'])
+    rec1.emitError({ name: 'UnknownError', message: 'late' })
+    rec1.emitStop()
+    rec2.emitData(['two'])
+    h.recorder.stop()
+    rec2.emitStop()
+
+    expect(h.takes).toHaveLength(2)
+    expect(h.takes[0].markers.map((m) => m.label)).toEqual(['旧标记'])
+    expect(h.takes[1].markers.map((m) => m.label)).toEqual(['新标记'])
+    expect(await readBlob(h.takes[1].blob)).toBe('two\n')
+  })
+
+  it('设备中断后重录：新 take 只带自己的标记，切换 take 不串标记', async () => {
+    const h = makeHarness()
+    const rec1 = await startTake(h)
+    h.clock.advance(300)
+    h.recorder.addMarker('中断条')
+    rec1.emitData(['a'])
+    h.sessions[0].tracks[0].emitEnded()
+    rec1.emitStop()
+    expect(h.takes[0].reason).toBe('device-interrupted')
+    expect(h.liveMarkers()).toEqual([])
+
+    const rec2 = await startTake(h)
+    h.clock.advance(500)
+    h.recorder.addMarker('重录条')
+    rec2.emitData(['b'])
+    h.recorder.stop()
+    rec2.emitStop()
+
+    expect(h.takes).toHaveLength(2)
+    expect(h.takes[0].markers.map((m) => m.label)).toEqual(['中断条'])
+    expect(h.takes[1].markers.map((m) => m.label)).toEqual(['重录条'])
+    // 标记 id 跨会话不冲突
+    const ids = h.takes.flatMap((t) => t.markers.map((m) => m.id))
+    expect(new Set(ids).size).toBe(ids.length)
+  })
+
+  it('取消等待授权：不产生 take，标记视图为空，重录从零开始', async () => {
+    const h = makeHarness({ manualPermissions: true })
+    h.recorder.start({ mode: 'av' })
+    // starting 期间打标被拒
+    expect(h.recorder.addMarker('授权中').reason).toBe('not-recording')
+    h.recorder.stop() // 取消
+    expect(h.liveMarkers()).toEqual([])
+    h.media.grant()
+    await h.flush()
+    expect(h.takes).toHaveLength(0)
+
+    h.recorder.start({ mode: 'av' })
+    h.media.grant()
+    await h.flush()
+    const rec = h.lastRecorder()
+    h.recorder.addMarker('新会话')
+    rec.emitData(['fresh'])
+    h.recorder.stop()
+    rec.emitStop()
+    expect(h.takes[0].markers.map((m) => m.label)).toEqual(['新会话'])
+  })
+
+  it('dispose 录制中：标记随会话丢弃，迟到事件不产生 take', async () => {
+    const h = makeHarness()
+    const rec = await startTake(h)
+    h.recorder.addMarker('卸载点')
+    expect(h.liveMarkers()).toHaveLength(1)
+    h.recorder.dispose()
+    expect(h.liveMarkers()).toEqual([])
+    rec.emitData(['late'])
+    rec.emitStop()
+    expect(h.takes).toHaveLength(0)
+    // dispose 后打标按“未在录制”拒绝
+    expect(h.recorder.addMarker('x').reason).toBe('not-recording')
+  })
+})
+
 describe('stop / dataavailable 交错的会话隔离', () => {
   it('stop 到达后才到的陈旧 dataavailable 不得改变成片', async () => {
     const h = makeHarness()
@@ -459,6 +851,7 @@ describe('依赖注入内核（自定义 deps）', () => {
         onTake: () => undefined,
         onError: () => undefined,
         onSettled: () => undefined,
+        onLiveMarkersChange: () => undefined,
       },
       deps,
     )

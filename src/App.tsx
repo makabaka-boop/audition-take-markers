@@ -1,9 +1,10 @@
-import { useEffect, useRef, type RefObject } from 'react'
+import { useEffect, useRef, useState, type RefObject } from 'react'
 import { useAuditionRecorder } from './hooks/useAuditionRecorder'
 import type {
   CaptureMode,
   RecorderStatus,
   Take,
+  TakeMarker,
 } from './recorder/CaptureRecorder'
 
 const STATUS_TEXT: Record<RecorderStatus, string> = {
@@ -25,6 +26,15 @@ function formatDuration(ms: number): string {
   const m = String(Math.floor(total / 60)).padStart(2, '0')
   const s = String(total % 60).padStart(2, '0')
   return `${m}:${s}`
+}
+
+/** 标记时间轴标签：与播放器 currentTime（秒）同源，精确到 0.1s */
+function formatMarkerTime(ms: number): string {
+  const totalSeconds = Math.max(0, ms) / 1000
+  const m = Math.floor(totalSeconds / 60)
+  const s = Math.floor(totalSeconds % 60)
+  const tenth = Math.floor((totalSeconds * 10) % 10)
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${tenth}`
 }
 
 function formatTime(ts: number): string {
@@ -90,6 +100,23 @@ function TakeReplay({
     }
   }, [take.url])
 
+  /**
+   * 定位到某个瞬间标记：标记时间是排除暂停的有效时钟，与成片 Blob 的
+   * 媒体时间轴一致，因此直接把播放器 currentTime 跳到该秒即可。
+   */
+  const jumpToMarker = (marker: TakeMarker) => {
+    const el = mediaRef.current
+    if (!el) return
+    const seconds = marker.timeMs / 1000
+    // 防御式裁剪：不越过媒体时长（jsdom 下 duration 为 NaN 时跳过裁剪）
+    const bounded =
+      Number.isFinite(el.duration) && el.duration > 0
+        ? Math.min(seconds, Math.max(0, el.duration - 0.001))
+        : Math.max(0, seconds)
+    el.currentTime = bounded
+    void el.play().catch(() => undefined)
+  }
+
   // 仅音频成片用 <audio> 回放，其余用 <video>
   return (
     <div className={`take-card${selected ? ' selected' : ''}`}>
@@ -111,6 +138,30 @@ function TakeReplay({
           className="take-video"
         />
       )}
+      {take.markers.length > 0 && (
+        <div className="marker-list" aria-label="本 take 的瞬间标记">
+          <p className="marker-list-title">
+            瞬间标记（{take.markers.length}）· 点击跳转
+          </p>
+          <ol>
+            {take.markers.map((marker) => (
+              <li key={marker.id}>
+                <button
+                  type="button"
+                  className="marker-jump-btn"
+                  onClick={() => jumpToMarker(marker)}
+                  aria-label={`跳转到 ${formatMarkerTime(marker.timeMs)} 的标记：${marker.label}`}
+                >
+                  <time dateTime={`PT${marker.timeMs / 1000}S`}>
+                    {formatMarkerTime(marker.timeMs)}
+                  </time>
+                  <span className="marker-label-text">{marker.label}</span>
+                </button>
+              </li>
+            ))}
+          </ol>
+        </div>
+      )}
       <div className="take-meta">
         <button
           type="button"
@@ -124,6 +175,7 @@ function TakeReplay({
         <span className="take-info">
           {MODE_TEXT[take.mode]} · {formatDuration(take.durationMs)} ·{' '}
           {formatTime(take.createdAt)}
+          {take.markers.length > 0 ? ` · ${take.markers.length} 个标记` : ''}
         </span>
         <span className={`take-reason reason-${take.reason}`}>
           {take.reason === 'user' ? '手动停止' : '设备中断'}
@@ -167,7 +219,39 @@ export default function App() {
     pause,
     resume,
     stop,
+    liveMarkers,
+    addMarker,
+    canMark,
+    maxMarkerLabelLength,
+    markerRejectMessage,
   } = useAuditionRecorder()
+
+  // 标记输入与提示均为组件本地状态；不进入内核，取消/重拍自然无残留
+  const [markerDraft, setMarkerDraft] = useState('')
+  const [markerNotice, setMarkerNotice] = useState<string | null>(null)
+
+  // 每次进入“录制中”都清空上一轮的输入与提示，保证切换 take/重录不串
+  const prevStatusRef = useRef<RecorderStatus>('idle')
+  useEffect(() => {
+    if (
+      status === 'recording' &&
+      prevStatusRef.current !== 'recording'
+    ) {
+      setMarkerDraft('')
+      setMarkerNotice(null)
+    }
+    prevStatusRef.current = status
+  }, [status])
+
+  const submitMarker = () => {
+    const result = addMarker(markerDraft)
+    if (result.ok) {
+      setMarkerDraft('')
+      setMarkerNotice(null)
+    } else if (result.reason) {
+      setMarkerNotice(markerRejectMessage[result.reason])
+    }
+  }
 
   const videoDevices = devices.filter((d) => d.kind === 'videoinput')
   const audioDevices = devices.filter((d) => d.kind === 'audioinput')
@@ -344,6 +428,62 @@ export default function App() {
               {status === 'starting' ? '取消' : '停止'}
             </button>
           </div>
+
+          <fieldset className="marker-row" aria-label="瞬间标记">
+            <legend>瞬间标记（按实际录制时长定位）</legend>
+            <div className="marker-compose">
+              <input
+                type="text"
+                className="marker-input"
+                value={markerDraft}
+                maxLength={maxMarkerLabelLength}
+                placeholder="给值得回看的瞬间写个短标签…"
+                aria-label="瞬间标记标签"
+                disabled={!canMark}
+                onChange={(e) => setMarkerDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && canMark) submitMarker()
+                }}
+              />
+              <button
+                type="button"
+                className="btn btn-marker"
+                onClick={submitMarker}
+                disabled={!canMark}
+              >
+                打标记
+              </button>
+            </div>
+            {/* 不可标记状态给出明确、持续可见的原因 */}
+            {!canMark && (
+              <p className="marker-hint" data-testid="marker-blocked-hint">
+                {status === 'paused'
+                  ? markerRejectMessage.paused
+                  : status === 'stopping'
+                    ? markerRejectMessage.stopping
+                    : status === 'starting'
+                      ? markerRejectMessage['not-recording'] +
+                        ' 正在等待设备授权。'
+                      : markerRejectMessage['not-recording']}
+              </p>
+            )}
+            {/* 空白/超长等非法标签的即时反馈 */}
+            {markerNotice && (
+              <p className="marker-notice" role="alert" aria-live="polite">
+                {markerNotice}
+              </p>
+            )}
+            {liveMarkers.length > 0 && (
+              <ol className="live-markers" aria-label="本次录制已打的标记">
+                {liveMarkers.map((m) => (
+                  <li key={m.id} className="live-marker">
+                    <time>{formatMarkerTime(m.timeMs)}</time>
+                    <span>{m.label}</span>
+                  </li>
+                ))}
+              </ol>
+            )}
+          </fieldset>
 
           {error && (
             <div className="error-box" role="alert">

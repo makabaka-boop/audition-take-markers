@@ -3,10 +3,14 @@ import {
   CAPTURE_MODES,
   CaptureError,
   CaptureRecorder,
+  MARKER_REJECT_MESSAGE,
+  MAX_MARKER_LABEL_LENGTH,
+  type AddMarkerResult,
   type CaptureMode,
   type RecorderDeps,
   type RecorderStatus,
   type Take,
+  type TakeMarker,
 } from '../recorder/CaptureRecorder'
 
 export interface MediaDeviceInfoLite {
@@ -58,6 +62,8 @@ export function useAuditionRecorder() {
   // 进行中的实际模式/MIME（starting 起冻结，回 idle 清空）
   const [activeMode, setActiveMode] = useState<CaptureMode | null>(null)
   const [activeMimeType, setActiveMimeType] = useState<string | null>(null)
+  /** 当前录制会话进行中的瞬间标记；停止/取消/失败/重录即清空，绝不串 take */
+  const [liveMarkers, setLiveMarkers] = useState<TakeMarker[]>([])
 
   const recorderRef = useRef<CaptureRecorder | null>(null)
   // take 列表镜像：卸载时批量 revoke，避免依赖 state 闭包过期
@@ -118,6 +124,7 @@ export function useAuditionRecorder() {
           // 授权过一次后 label 才完整，停止后刷新设备清单
           void refreshDevices()
         },
+        onLiveMarkersChange: (markers) => setLiveMarkers(markers.slice()),
       },
       createBrowserDeps(),
     )
@@ -163,6 +170,20 @@ export function useAuditionRecorder() {
   const resume = useCallback(() => recorderRef.current?.resume(), [])
   const stop = useCallback(() => recorderRef.current?.stop(), [])
 
+  /**
+   * 录制中打下瞬间标记。仅 recording 态可写入；其余状态/非法标签由内核
+   * 拒绝，调用方按返回的 message 给出明确提示（不改变任何录制状态）。
+   */
+  const addMarker = useCallback((rawLabel: string): AddMarkerResult => {
+    const result = recorderRef.current?.addMarker(rawLabel)
+    return (
+      result ?? {
+        ok: false,
+        reason: 'not-recording' as const,
+      }
+    )
+  }, [])
+
   const selectTake = useCallback((id: string) => setSelectedTakeId(id), [])
 
   const deleteTake = useCallback((id: string) => {
@@ -180,6 +201,8 @@ export function useAuditionRecorder() {
   const canSwitchDevice = isIdle
   // 当前所选模式有可用 MIME 才允许开拍；冻结期间（starting…）按钮同样禁用
   const canStart = isIdle && mimeByMode[mode] !== null
+  // 只有真正录制中（未暂停、未冻结停止）允许写标记
+  const canMark = status === 'recording'
   const selectedTake = takes.find((t) => t.id === selectedTakeId) ?? null
 
   return {
@@ -223,5 +246,12 @@ export function useAuditionRecorder() {
     pause,
     resume,
     stop,
+    // 瞬间标记：仅 recording 可写；liveMarkers 是当前会话的进行中标记，
+    // 冻结后的标记随 take.markers 交付（停止/取消/失败/重录自动清空）。
+    liveMarkers,
+    addMarker,
+    canMark,
+    maxMarkerLabelLength: MAX_MARKER_LABEL_LENGTH,
+    markerRejectMessage: MARKER_REJECT_MESSAGE,
   }
 }

@@ -2,6 +2,7 @@ import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest'
 import { act, renderHook, waitFor } from '@testing-library/react'
 import { useAuditionRecorder } from './useAuditionRecorder'
 import { FakeMediaRecorder, FakeTrack } from '../test/fakes'
+import { STOP_FINALIZE_GRACE_MS } from '../recorder/CaptureRecorder'
 
 /**
  * hook 层测试：通过全局 navigator.mediaDevices / MediaRecorder 替身，
@@ -293,6 +294,258 @@ describe('useAuditionRecorder', () => {
     expect(result.current.takes).toHaveLength(1)
     expect(result.current.takes[0].id).toBe(takeA.id)
     expect(result.current.selectedTake?.id).toBe(takeA.id)
+  })
+})
+
+describe('瞬间标记（hook 集成）', () => {
+  /** 假定时器下不能用 waitFor（其轮询依赖定时器）：手动排空微任务 */
+  async function flushMicrotasks(times = 5) {
+    await act(async () => {
+      for (let i = 0; i < times; i++) await Promise.resolve()
+    })
+  }
+
+  afterEach(() => {
+    // 用例即便中途断言失败也要恢复真实定时器，避免污染后续用例
+    vi.useRealTimers()
+  })
+
+  it('录制中 addMarker 写入有效时钟标记并出现在 liveMarkers；停止后随 take 冻结且 liveMarkers 清空', async () => {
+    installGlobals({})
+    const { result } = renderHook(() => useAuditionRecorder())
+    await waitFor(() => expect(result.current.canStart).toBe(true))
+
+    await act(async () => {
+      await result.current.start()
+    })
+    expect(result.current.canMark).toBe(true)
+
+    await act(async () => {
+      const r1 = result.current.addMarker('第一个')
+      expect(r1.ok).toBe(true)
+    })
+    expect(result.current.liveMarkers.map((m) => m.label)).toEqual(['第一个'])
+
+    const rec = FakeMediaRecorder.instances[
+      FakeMediaRecorder.instances.length - 1
+    ]
+    await act(async () => {
+      rec.emitData(['marked-take'])
+      result.current.stop()
+      rec.emitStop()
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+
+    expect(result.current.status).toBe('idle')
+    expect(result.current.canMark).toBe(false)
+    expect(result.current.liveMarkers).toEqual([])
+    const take = result.current.takes[0]
+    expect(take.markers.map((m) => m.label)).toEqual(['第一个'])
+  })
+
+  it('同毫秒多次标记按创建次序（seq）保留', async () => {
+    vi.useFakeTimers()
+    installGlobals({})
+    const { result } = renderHook(() => useAuditionRecorder())
+    await flushMicrotasks()
+
+    await act(async () => {
+      result.current.start()
+      await Promise.resolve()
+    })
+    expect(result.current.status).toBe('recording')
+
+    await act(async () => {
+      vi.advanceTimersByTime(1000)
+    })
+    // 不推进时钟连续打三个：时间戳相同，次序保留
+    await act(async () => {
+      const a = result.current.addMarker('甲')
+      const b = result.current.addMarker('乙')
+      const c = result.current.addMarker('丙')
+      expect([a, b, c].every((r) => r.ok)).toBe(true)
+    })
+    expect(result.current.liveMarkers.map((m) => m.timeMs)).toEqual([
+      1000, 1000, 1000,
+    ])
+    expect(result.current.liveMarkers.map((m) => m.seq)).toEqual([0, 1, 2])
+
+    const rec = FakeMediaRecorder.instances[
+      FakeMediaRecorder.instances.length - 1
+    ]
+    await act(async () => {
+      rec.emitData(['triple'])
+      result.current.stop()
+      rec.emitStop()
+      // 排空可能残留的兜底定时器任务，避免 act 外的状态更新告警
+      vi.advanceTimersByTime(STOP_FINALIZE_GRACE_MS + 10)
+    })
+    expect(
+      result.current.takes[0].markers.map((m) => [m.timeMs, m.seq]),
+    ).toEqual([
+      [1000, 0],
+      [1000, 1],
+      [1000, 2],
+    ])
+    vi.useRealTimers()
+  })
+
+  it('暂停边界：暂停段标记被拒且不写入，继续后标记时间不含暂停段', async () => {
+    vi.useFakeTimers()
+    installGlobals({})
+    const { result } = renderHook(() => useAuditionRecorder())
+    await flushMicrotasks()
+
+    await act(async () => {
+      result.current.start()
+      await Promise.resolve()
+    })
+    act(() => {
+      vi.advanceTimersByTime(1000)
+      result.current.addMarker('暂停前')
+      result.current.pause()
+      vi.advanceTimersByTime(8000) // 暂停 8 秒
+    })
+    expect(result.current.status).toBe('paused')
+    expect(result.current.canMark).toBe(false)
+    act(() => {
+      const rejected = result.current.addMarker('暂停中')
+      expect(rejected).toEqual({ ok: false, reason: 'paused' })
+      result.current.resume()
+      vi.advanceTimersByTime(500) // 继续后又录 500
+    })
+    expect(result.current.status).toBe('recording')
+    act(() => {
+      const r = result.current.addMarker('继续后')
+      expect(r.ok).toBe(true)
+    })
+    expect(result.current.liveMarkers.map((m) => [m.label, m.timeMs])).toEqual([
+      ['暂停前', 1000],
+      ['继续后', 1500],
+    ])
+
+    const rec = FakeMediaRecorder.instances[
+      FakeMediaRecorder.instances.length - 1
+    ]
+    await act(async () => {
+      rec.emitData(['pause-edge'])
+      result.current.stop()
+      rec.emitStop()
+      vi.advanceTimersByTime(STOP_FINALIZE_GRACE_MS + 10)
+    })
+    expect(result.current.takes[0].durationMs).toBe(1500)
+    expect(result.current.takes[0].markers.map((m) => m.label)).toEqual([
+      '暂停前',
+      '继续后',
+    ])
+    vi.useRealTimers()
+  })
+
+  it('等待权限（starting）/ 收尾中（stopping）/ 已结束（idle）打标均被明确拒绝', async () => {
+    const g = installGlobals({ manualPermissions: true })
+    const { result } = renderHook(() => useAuditionRecorder())
+    await waitFor(() => expect(result.current.canStart).toBe(true))
+
+    // idle（未开拍）
+    expect(result.current.addMarker('x')).toEqual({
+      ok: false,
+      reason: 'not-recording',
+    })
+
+    await act(async () => {
+      result.current.start()
+    })
+    expect(result.current.status).toBe('starting')
+    expect(result.current.addMarker('等待权限').reason).toBe('not-recording')
+
+    await act(async () => {
+      g.grant()
+      await Promise.resolve()
+    })
+    const rec = FakeMediaRecorder.instances[
+      FakeMediaRecorder.instances.length - 1
+    ]
+    act(() => {
+      rec.emitData(['d'])
+      result.current.stop()
+    })
+    expect(result.current.status).toBe('stopping')
+    expect(result.current.addMarker('收尾中').reason).toBe('stopping')
+
+    await act(async () => {
+      rec.emitStop()
+      await Promise.resolve()
+    })
+    expect(result.current.status).toBe('idle')
+    expect(result.current.addMarker('结束后').reason).toBe('not-recording')
+    // 收尾中那次拒绝未写入；take 上没有标记
+    expect(result.current.takes[0].markers).toEqual([])
+  })
+
+  it('空白/超长标签被拒，且 hook 暴露文案常量与长度上限', async () => {
+    installGlobals({})
+    const { result } = renderHook(() => useAuditionRecorder())
+    await waitFor(() => expect(result.current.canStart).toBe(true))
+
+    await act(async () => {
+      await result.current.start()
+    })
+    expect(result.current.addMarker('   ').reason).toBe('empty-label')
+    expect(
+      result.current.addMarker(
+        '长'.repeat(result.current.maxMarkerLabelLength + 1),
+      ).reason,
+    ).toBe('label-too-long')
+    expect(result.current.liveMarkers).toEqual([])
+    expect(result.current.markerRejectMessage.stopping).toContain('收尾')
+  })
+
+  it('设备中断重录：第一条的标记不串到第二条，liveMarkers 会话间自动清空', async () => {
+    const g = installGlobals({})
+    const { result } = renderHook(() => useAuditionRecorder())
+    await waitFor(() => expect(result.current.canStart).toBe(true))
+
+    await act(async () => {
+      await result.current.start()
+    })
+    act(() => result.current.addMarker('中断条'))
+    const rec1 = FakeMediaRecorder.instances[
+      FakeMediaRecorder.instances.length - 1
+    ]
+    await act(async () => {
+      rec1.emitData(['a'])
+      // 拔掉设备（视频轨 ended）：内核走 device-interrupted 路径
+      g.tracks()[0].emitEnded()
+      rec1.emitData(['tail'])
+      rec1.emitStop()
+      await Promise.resolve()
+    })
+    expect(result.current.takes[0].reason).toBe('device-interrupted')
+    expect(result.current.liveMarkers).toEqual([])
+    expect(result.current.takes[0].markers.map((m) => m.label)).toEqual([
+      '中断条',
+    ])
+
+    // 重录一条
+    await act(async () => {
+      await result.current.start()
+    })
+    expect(result.current.liveMarkers).toEqual([])
+    act(() => result.current.addMarker('重录条'))
+    const rec2 = FakeMediaRecorder.instances[
+      FakeMediaRecorder.instances.length - 1
+    ]
+    await act(async () => {
+      rec2.emitData(['b'])
+      result.current.stop()
+      rec2.emitStop()
+      await Promise.resolve()
+    })
+    expect(result.current.takes).toHaveLength(2)
+    expect(result.current.takes[1].markers.map((m) => m.label)).toEqual([
+      '重录条',
+    ])
   })
 })
 
