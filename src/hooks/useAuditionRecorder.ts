@@ -3,10 +3,12 @@ import {
   CAPTURE_MODES,
   CaptureError,
   CaptureRecorder,
+  type AddMarkerResult,
   type CaptureMode,
   type RecorderDeps,
   type RecorderStatus,
   type Take,
+  type TakeMarker,
 } from '../recorder/CaptureRecorder'
 
 export interface MediaDeviceInfoLite {
@@ -58,6 +60,12 @@ export function useAuditionRecorder() {
   // 进行中的实际模式/MIME（starting 起冻结，回 idle 清空）
   const [activeMode, setActiveMode] = useState<CaptureMode | null>(null)
   const [activeMimeType, setActiveMimeType] = useState<string | null>(null)
+  /**
+   * 当前录制会话实时累积的瞬间标记（仅 recording 中可写入）。
+   * 进入新会话（starting）或落定回 idle 时清空：停止成功后标记改由
+   * 所选/列表 Take.markers 提供，切换 take 自然各带各的标记。
+   */
+  const [liveMarkers, setLiveMarkers] = useState<TakeMarker[]>([])
 
   const recorderRef = useRef<CaptureRecorder | null>(null)
   // take 列表镜像：卸载时批量 revoke，避免依赖 state 闭包过期
@@ -106,12 +114,20 @@ export function useAuditionRecorder() {
           setActiveMode(recorder.getActiveMode())
           setActiveMimeType(recorder.getActiveMimeType())
           setLiveStream((recorder.getActiveStream() as MediaStream | null) ?? null)
+          // 标记按会话存活：新会话开拍或落定回 idle 都必须清空实时镜像，
+          // 旧会话迟到的 onMarker 不可能残留到新 take 的界面上。
+          if (next === 'starting' || next === 'idle') setLiveMarkers([])
         },
         onTake: (take) => {
           takesRef.current = [...takesRef.current, take]
           setTakes(takesRef.current)
           // 首次成片自动选为交付版；之后不抢夺用户选择
           setSelectedTakeId((prev) => prev ?? take.id)
+        },
+        onMarker: (marker) => {
+          // 内核按会话守卫，回调一次即一条新标记；追加次序即创建次序
+          // （同毫秒以 order 稳定区分），回放冻结时不重排。
+          setLiveMarkers((prev) => [...prev, marker])
         },
         onError: (err) => setError(err),
         onSettled: () => {
@@ -163,6 +179,26 @@ export function useAuditionRecorder() {
   const resume = useCallback(() => recorderRef.current?.resume(), [])
   const stop = useCallback(() => recorderRef.current?.stop(), [])
 
+  /**
+   * 写入瞬间标记：只有正在录制且未冻结停止时成功。
+   * 返回明确结局供 UI 即时提示（暂停/等待权限/停止中/已结束/空标签…），
+   * 时间戳由内核用排除暂停的有效时钟打。
+   */
+  const addMarker = useCallback(
+    (label: string): AddMarkerResult => {
+      const recorder = recorderRef.current
+      if (!recorder) {
+        return {
+          ok: false,
+          reason: 'not-recording',
+          message: '当前没有正在录制的 take，不能打标记。',
+        }
+      }
+      return recorder.addMarker(label)
+    },
+    [],
+  )
+
   const selectTake = useCallback((id: string) => setSelectedTakeId(id), [])
 
   const deleteTake = useCallback((id: string) => {
@@ -180,6 +216,8 @@ export function useAuditionRecorder() {
   const canSwitchDevice = isIdle
   // 当前所选模式有可用 MIME 才允许开拍；冻结期间（starting…）按钮同样禁用
   const canStart = isIdle && mimeByMode[mode] !== null
+  // 瞬间标记只在录制中可写入：暂停/等待权限/停止中/已结束一律禁用入口
+  const canMark = status === 'recording'
   const selectedTake = takes.find((t) => t.id === selectedTakeId) ?? null
 
   return {
@@ -218,10 +256,13 @@ export function useAuditionRecorder() {
     error,
     canStart,
     canSwitchDevice,
+    canMark,
+    liveMarkers,
     liveStream,
     start,
     pause,
     resume,
     stop,
+    addMarker,
   }
 }

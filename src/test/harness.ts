@@ -5,6 +5,7 @@ import {
   type MediaRecorderLikeCtor,
   type StopReason,
   type Take,
+  type TakeMarker,
 } from '../recorder/CaptureRecorder'
 import {
   controllableGetUserMedia,
@@ -22,6 +23,8 @@ export interface Harness {
   errors: CaptureError[]
   statuses: string[]
   settlements: Array<{ reason: StopReason; error?: CaptureError }>
+  /** onMarker 实时回调收到的标记（成功写入一条即一条） */
+  liveMarkers: TakeMarker[]
   urls: Map<string, Blob>
   /** 虚拟时钟：nowMs 读写虚拟时间，advance 推进并触发兜底定时器 */
   clock: VirtualClock
@@ -48,6 +51,7 @@ export function makeHarness(getUserMediaOpts?: {
   const errors: CaptureError[] = []
   const statuses: string[] = []
   const settlements: Harness['settlements'] = []
+  const liveMarkers: TakeMarker[] = []
   const urls = new Map<string, Blob>()
   const clock = createVirtualClock(1000)
   const calls: MediaStreamConstraints[] = []
@@ -58,6 +62,7 @@ export function makeHarness(getUserMediaOpts?: {
       onStatusChange: (s) => statuses.push(s),
       onTake: (t) => takes.push(t),
       onError: (e) => errors.push(e),
+      onMarker: (m) => liveMarkers.push(m),
       onSettled: (reason, error) =>
         settlements.push({ reason, error }),
     },
@@ -96,6 +101,7 @@ export function makeHarness(getUserMediaOpts?: {
     errors,
     statuses,
     settlements,
+    liveMarkers,
     urls,
     clock,
     media,

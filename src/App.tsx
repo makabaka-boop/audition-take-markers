@@ -1,9 +1,11 @@
-import { useEffect, useRef, type RefObject } from 'react'
+import { useEffect, useRef, useState, type RefObject } from 'react'
 import { useAuditionRecorder } from './hooks/useAuditionRecorder'
-import type {
-  CaptureMode,
-  RecorderStatus,
-  Take,
+import {
+  MARKER_LABEL_MAX_LENGTH,
+  type CaptureMode,
+  type RecorderStatus,
+  type Take,
+  type TakeMarker,
 } from './recorder/CaptureRecorder'
 
 const STATUS_TEXT: Record<RecorderStatus, string> = {
@@ -31,6 +33,23 @@ function formatTime(ts: number): string {
   const d = new Date(ts)
   const pad = (n: number) => String(n).padStart(2, '0')
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+/** 标记的成片内时间：mm:ss.mmm（毫秒精度，与播放器 currentTime 对齐） */
+function formatMarkerTime(ms: number): string {
+  const clamped = Math.max(0, Math.round(ms))
+  const m = String(Math.floor(clamped / 60000)).padStart(2, '0')
+  const s = String(Math.floor((clamped % 60000) / 1000)).padStart(2, '0')
+  const millis = String(clamped % 1000).padStart(3, '0')
+  return `${m}:${s}.${millis}`
+}
+
+/** 非录制状态下“为什么此刻不能打标记”的明确提示（与内核拒绝文案呼应） */
+const MARKER_BLOCKED_HINT: Partial<Record<RecorderStatus, string>> = {
+  starting: '正在等待设备授权，授权后开始录制才可打标记。',
+  paused: '已暂停，不能打标记；继续录制后再标记。',
+  stopping: '正在收尾停止，标记已随本 take 冻结。',
+  idle: '当前没有正在录制的 take，开始录制后才可打标记。',
 }
 
 async function downloadTake(take: Take) {
@@ -90,7 +109,16 @@ function TakeReplay({
     }
   }, [take.url])
 
-  // 仅音频成片用 <audio> 回放，其余用 <video>
+  /** 定位到标记时刻：标记时间与成片时长同一套排除暂停的有效时钟 */
+  const jumpToMarker = (marker: TakeMarker) => {
+    const el = mediaRef.current
+    if (!el) return
+    // 永不越过成片有效时长（标记已在停止时按冻结时长裁剪，这里再夹一次）
+    const seconds = Math.min(marker.timeMs, take.durationMs) / 1000
+    el.currentTime = seconds
+    void el.play().catch(() => undefined)
+  }
+
   return (
     <div className={`take-card${selected ? ' selected' : ''}`}>
       {take.mode === 'audio-only' ? (
@@ -100,6 +128,7 @@ function TakeReplay({
             ref={mediaRef as RefObject<HTMLAudioElement>}
             controls
             playsInline
+            preload="metadata"
             className="take-audio"
           />
         </div>
@@ -108,6 +137,7 @@ function TakeReplay({
           ref={mediaRef as RefObject<HTMLVideoElement>}
           controls
           playsInline
+          preload="metadata"
           className="take-video"
         />
       )}
@@ -137,6 +167,129 @@ function TakeReplay({
           删除
         </button>
       </div>
+      {take.markers.length > 0 && (
+        <div className="take-markers" aria-label="瞬间标记">
+          <p className="markers-title">瞬间标记（{take.markers.length}）</p>
+          <ul className="marker-list">
+            {take.markers.map((marker) => (
+              <li key={`${marker.timeMs}-${marker.order}`}>
+                <button
+                  type="button"
+                  className="marker-chip"
+                  data-marker-time={marker.timeMs}
+                  data-marker-order={marker.order}
+                  onClick={() => jumpToMarker(marker)}
+                  title={`跳转到 ${formatMarkerTime(marker.timeMs)}`}
+                >
+                  <span className="marker-time">
+                    {formatMarkerTime(marker.timeMs)}
+                  </span>
+                  <span className="marker-label">{marker.label}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** 录制中写入瞬间标记的面板：只在 recording 放开输入，其余状态给明确提示 */
+function MarkerPanel({
+  status,
+  canMark,
+  liveMarkers,
+  onAdd,
+}: {
+  status: RecorderStatus
+  canMark: boolean
+  liveMarkers: TakeMarker[]
+  onAdd: (label: string) => { ok: boolean; message?: string }
+}) {
+  const [label, setLabel] = useState('')
+  const [feedback, setFeedback] = useState<{
+    kind: 'ok' | 'error'
+    text: string
+  } | null>(null)
+
+  const submit = () => {
+    const result = onAdd(label)
+    if (result.ok) {
+      setFeedback({ kind: 'ok', text: '已标记。' })
+      setLabel('')
+    } else {
+      setFeedback({ kind: 'error', text: result.message ?? '不能打标记。' })
+    }
+  }
+
+  return (
+    <div className="marker-panel" aria-label="瞬间标记">
+      <label className="marker-input-row">
+        <span>瞬间标记</span>
+        <input
+          type="text"
+          className="marker-input"
+          value={label}
+          maxLength={MARKER_LABEL_MAX_LENGTH}
+          placeholder={
+            canMark ? '给值得回看的瞬间写个短标签，回车打标' : '仅录制中可打标记'
+          }
+          disabled={!canMark}
+          aria-label="瞬间标记标签"
+          onChange={(e) => {
+            setLabel(e.target.value)
+            if (feedback) setFeedback(null)
+          }}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault()
+              if (canMark) submit()
+            }
+          }}
+        />
+        <button
+          type="button"
+          className="btn btn-marker"
+          onClick={submit}
+          disabled={!canMark}
+        >
+          打标记
+        </button>
+      </label>
+      <p
+        className={`marker-hint${canMark ? '' : ' marker-hint-blocked'}`}
+        aria-live="off"
+      >
+        {canMark
+          ? '标记时间取实际录制时长（自动扣除暂停），同毫秒多次标记按先后保留。'
+          : MARKER_BLOCKED_HINT[status]}
+      </p>
+      {feedback && (
+        <p
+          className={`marker-feedback marker-feedback-${feedback.kind}`}
+          role={feedback.kind === 'error' ? 'alert' : 'status'}
+        >
+          {feedback.text}
+        </p>
+      )}
+      {liveMarkers.length > 0 && (
+        <ul className="marker-list marker-list-live">
+          {liveMarkers.map((marker) => (
+            <li key={`${marker.timeMs}-${marker.order}`}>
+              <span
+                className="marker-live-chip"
+                data-live-marker-time={marker.timeMs}
+              >
+                <span className="marker-time">
+                  {formatMarkerTime(marker.timeMs)}
+                </span>
+                <span className="marker-label">{marker.label}</span>
+              </span>
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   )
 }
@@ -162,11 +315,14 @@ export default function App() {
     error,
     canStart,
     canSwitchDevice,
+    canMark,
+    liveMarkers,
     liveStream,
     start,
     pause,
     resume,
     stop,
+    addMarker,
   } = useAuditionRecorder()
 
   const videoDevices = devices.filter((d) => d.kind === 'videoinput')
@@ -351,6 +507,13 @@ export default function App() {
               {error.message}
             </div>
           )}
+
+          <MarkerPanel
+            status={status}
+            canMark={canMark}
+            liveMarkers={liveMarkers}
+            onAdd={addMarker}
+          />
         </div>
       </section>
 

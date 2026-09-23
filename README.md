@@ -1,6 +1,6 @@
 # 试镜采集台（Audition Capture Bench）
 
-纯前端的试镜采集台：授权摄像头与麦克风后，对一个 take 执行**开始 / 暂停 / 继续 / 停止**，停止后形成成片，可回放、选为交付版并下载。支持三种采集模式：**音视频（默认）/ 仅视频 / 仅音频**，仅空闲时可切换。
+纯前端的试镜采集台：授权摄像头与麦克风后，对一个 take 执行**开始 / 暂停 / 继续 / 停止**，录制中可随时打**瞬间标记**（短标签，时间按排除暂停的实际录制时长），停止后形成成片与冻结标记，可回放、点标记跳转、选为交付版并下载。支持三种采集模式：**音视频（默认）/ 仅视频 / 仅音频**，仅空闲时可切换。
 
 - **无后端、无任何在线服务**：Vite 构建为纯静态文件，nginx 只负责托管。
 - **成片不持久化**：take 仅以 `Blob` + `blob:` 对象 URL 存在于当前页面内存，刷新或关闭即清空；删除 take 或卸载页面会释放轨道与对象 URL。
@@ -57,6 +57,18 @@ docker compose --profile verify run --rm verify
 - 采集计划只请求所需轨道：仅音频传 `video:false`、仅视频传 `audio:false`，不相关的设备选择不进入约束；因此缺少无关设备（如仅视频时没有麦克风）不算失败。
 - take 保存采集模式与**实际** MIME：仅音频成片用 `<audio>` 回放，其余用 `<video>`；下载始终指向当前所选交付 take 的对象 URL。
 
+### 瞬间标记（moments）
+
+导演在录制中给“值得回看的瞬间”打短标签，回放时按**实际录制时长**定位跳转，暂停与设备中断都不会让标记漂移：
+
+- **写入窗口**：`addMarker(label)` 只在 `recording` 且尚未冻结停止时接受。`starting`（等待权限）/ `paused` / `stopping`（停止中）/ `idle`（含已结束）一律拒绝，并返回 `{ok:false, reason, message}` 的明确提示（UI 同步禁用输入并展示原因）；标签先 trim，空串与超过 `MARKER_LABEL_MAX_LENGTH`（50）同样拒绝，不产生标记。
+- **有效时钟**：标记时间戳与成片时长共用同一套排除暂停的时钟（`currentElapsed`：各录制段累计，暂停/授权等待/封装等待均不计入），暂停多久标记都不漂移。
+- **同毫秒次序**：同一毫秒可连续写入多条，会话内自增 `order` 区分创建次序；冻结后的 `take.markers` 按 `(timeMs, order)` 升序，绝不重排。
+- **随成片冻结与裁剪**：停止成功后标记与该 take 的 Blob、`durationMs` 一同冻结；停止超时（兜底收尾）或设备中断时，标记按停止冻结的有效时长裁剪（`timeMs <= durationMs`，纯函数 `freezeTakeMarkers`，返回不可变排序副本），跳转点永不越过成片时长。
+- **空 Blob 无带标记 take**：全程零数据（`empty-take`/`stop-failed`）时不产生成片，标记随失败会话一起丢弃。
+- **会话隔离**：标记挂在会话对象上，旧 take 的 recorder 迟到事件/调用受 session 守卫挡下，**绝不可能把标记附到新 take**；切换 take 各带各的冻结标记，删除 take 随之一并释放。
+- 回放卡片中每条标记是一个按钮，点击把对应 `<video>/<audio>` 的 `currentTime` 定位到 `timeMs/1000` 并播放（再按 `durationMs` 夹一次），实现标记与播放器时间同步。
+
 ## 生命周期与交错处理（核心约束）
 
 录制内核见 `src/recorder/CaptureRecorder.ts`，状态机为：
@@ -96,6 +108,8 @@ Vitest + jsdom + Testing Library。`src/test/fakes.ts` 提供可精确编排事�
 - 设备中断 + inactive `InvalidStateError` 的微任务兜底（仍只产出一个成片）；
 - **延迟结束 / 停止抛错 / 无结束事件**（虚拟时钟 + 伪 MediaRecorder）：封装等待不计入时长，兜底窗口后强制回 idle、释放全部轨道，有数据保留唯一一个成片、零数据报 `stop-failed`，且可立即再录；
 - 真实 stop 与兜底定时器竞争只落定一次；starting 中 dispose 后迟到授权流被释放；
+- **瞬间标记**（虚拟时钟 + 可控 MediaRecorder）：录制中写入与有效时钟、暂停边界不漂移；同毫秒按 `order` 保序；paused/starting/stopping/idle 及空/超长标签的明确拒绝；停止成功后随 Blob/时长冻结，停止超时与设备中断按冻结时长裁剪，空 Blob 不生成带标记 take；`stop`/`dataavailable` 乱序下标记与成片一致；旧 take 迟到事件不把标记附到新 take、连续多 take 与中断后重录不串标记；
+- **页面测试核对标记与播放器时间同步**：录制中实时标记列表、暂停提示，停止后点击标记把 `video.currentTime` 定位到精确的有效时间（含同毫秒两条、中断 take 与重录 take 各自播放器不串扰）；
 - 删除/卸载释放对象 URL 与轨道；
 - hook 层：仅空闲可切换设备与模式、授权失败不毁旧成片、新拍失败保留已选交付版。
 

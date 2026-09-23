@@ -19,6 +19,11 @@
  *    不可能污染新 take。
  * 7. 设备中断（轨道 ended 或 recorder error）只触发一次停止，并标注原因；
  *    有数据则保留成片，无数据则失败报错。
+ * 8. 瞬间标记（addMarker）只在 recording 且未冻结停止时接受，时间戳取自
+ *    排除暂停的有效时钟 currentElapsed；停止落定时随成片一起冻结，并按
+ *    冻结的有效时长裁剪（超出部分绝不保留）。标记挂在会话对象上，旧会话
+ *    迟到的事件/调用不可能把标记附到新 take；空 Blob 不产生 take，标记
+ *    随会话一起丢弃。
  */
 
 export type RecorderStatus =
@@ -27,6 +32,37 @@ export type RecorderStatus =
   | 'recording'
   | 'paused'
   | 'stopping'
+
+/** 瞬间标记短标签的最大长度（trim 后计） */
+export const MARKER_LABEL_MAX_LENGTH = 50
+
+/**
+ * 瞬间标记：录制中由导演写入、停止后随 take 冻结。
+ * 同一毫秒可写入多条，order 为会话内自增创建次序，排序键为
+ * (timeMs, order)——暂停与设备中断都不会让时间戳漂移。
+ */
+export interface TakeMarker {
+  /** 短标签（写入时已 trim，非空、长度受限） */
+  label: string
+  /** 相对成片起点的有效时间（毫秒，扣除暂停/授权等待/封装等待） */
+  timeMs: number
+  /** 会话内自增序号：相同毫秒按创建次序排列 */
+  order: number
+}
+
+/** addMarker 被状态/内容守卫拒绝时的原因 */
+export type MarkerRejectCode =
+  | 'not-recording'
+  | 'starting'
+  | 'paused'
+  | 'stopping'
+  | 'label-blank'
+  | 'label-too-long'
+
+/** addMarker 的确定结局：成功带回冻结前的标记，失败带回明确原因与文案 */
+export type AddMarkerResult =
+  | { ok: true; marker: TakeMarker }
+  | { ok: false; reason: MarkerRejectCode; message: string }
 
 /** 采集模式：音视频（默认）/ 仅视频 / 仅音频 */
 export type CaptureMode = 'av' | 'video-only' | 'audio-only'
@@ -67,6 +103,11 @@ export interface Take {
   blob: Blob
   /** 实际采集时长（毫秒，扣除暂停时段，使用挂钟时间） */
   durationMs: number
+  /**
+   * 随成片冻结的瞬间标记，按 (timeMs, order) 升序；
+   * 已按 durationMs 裁剪，跳转时与播放器有效时间一一对应。
+   */
+  markers: TakeMarker[]
   mimeType: string
   reason: StopReason
   createdAt: number
@@ -189,6 +230,11 @@ export interface RecorderCallbacks {
   onStatusChange: (status: RecorderStatus) => void
   onTake: (take: Take) => void
   onError: (error: CaptureError) => void
+  /**
+   * 录制中每写入一条瞬间标记即回调（已通过状态/标签守卫）。
+   * 可选；停止落定后标记改由 Take.markers 提供。
+   */
+  onMarker?: (marker: TakeMarker) => void
   /** 停止已落定（无论成片还是失败），UI 可借此刷新设备标签等 */
   onSettled: (reason: StopReason, error?: CaptureError) => void
 }
@@ -220,6 +266,13 @@ interface ActiveSession {
    * 一旦冻结，最终时长即此值：暂停、授权等待与封装等待均不计入。
    */
   frozenDurationMs: number | null
+  /**
+   * 本会话已写入的瞬间标记（按创建次序追加；同一毫秒以 order 区分）。
+   * 只有 recording 态可写入；停止落定时随成片冻结并按 frozenDurationMs 裁剪。
+   */
+  markers: TakeMarker[]
+  /** 会话内标记自增序号 */
+  markerSeq: number
   /** 编码器迟迟不落定时强制收尾的兜底定时器句柄 */
   stopTimer: unknown
   /** 兜底是否由定时器强制触发（用于区分失败文案） */
@@ -235,6 +288,18 @@ const MODE_DEVICE_TEXT: Record<CaptureMode, string> = {
   'video-only': '摄像头',
   'audio-only': '麦克风',
 }
+
+/** 各状态/内容守卫拒绝写入瞬间标记时给用户的明确提示 */
+const MARKER_REJECT_MESSAGE: Record<MarkerRejectCode, string> = {
+  paused: '已暂停，不能打标记；继续录制后再标记。',
+  starting: '正在等待设备授权，尚未开始录制，不能打标记。',
+  stopping: '正在收尾停止，标记已冻结，不能再写入。',
+  'not-recording': '当前没有正在录制的 take，不能打标记。',
+  'label-blank': '标记内容不能为空，请输入短标签。',
+  'label-too-long': `标记最多 ${MARKER_LABEL_MAX_LENGTH} 个字，请缩短后再试。`,
+}
+
+const MARKERS_EMPTY: readonly TakeMarker[] = Object.freeze([])
 
 function codecUnsupportedMessage(mode: CaptureMode): string {
   if (mode === 'audio-only') {
@@ -406,6 +471,8 @@ export class CaptureRecorder {
       stopRequested: false,
       finalized: false,
       frozenDurationMs: null,
+      markers: [],
+      markerSeq: 0,
       stopTimer: null,
       forcedByTimer: false,
       stopReason: 'user',
@@ -481,6 +548,58 @@ export class CaptureRecorder {
     a.startedAt = this.deps.now()
     a.pausedAt = null
     this.setStatus('recording')
+  }
+
+  /**
+   * 写入一条瞬间标记。
+   *
+   * 仅当正在录制（recording）且尚未冻结停止时接受：
+   * - starting（等待权限）/ paused / stopping / idle（含已结束）一律拒绝，
+   *   并给出与状态对应的明确文案；
+   * - 标签先 trim，空串或超长同样拒绝，不产生任何标记；
+   * - 时间戳取 currentElapsed —— 与成片时长同一套“排除暂停”的有效时钟，
+   *   暂停多久都不会让标记漂移；
+   * - 同毫秒多次写入各自独立，order 为会话内自增创建次序；
+   * - 标记挂在当前会话上：旧会话迟到的调用/事件不可能写入新 take。
+   */
+  addMarker(label: string): AddMarkerResult {
+    if (this.disposed) {
+      return this.rejectMarker('not-recording')
+    }
+    if (this.status !== 'recording') {
+      const reason: MarkerRejectCode =
+        this.status === 'paused'
+          ? 'paused'
+          : this.status === 'starting'
+            ? 'starting'
+            : this.status === 'stopping'
+              ? 'stopping'
+              : 'not-recording'
+      return this.rejectMarker(reason)
+    }
+    const a = this.active
+    // recording 态理论上必有活动会话；防御式兜底，绝不把标记写到错误的 take
+    if (!a) return this.rejectMarker('not-recording')
+
+    const text = label.trim()
+    if (!text) return this.rejectMarker('label-blank')
+    if (text.length > MARKER_LABEL_MAX_LENGTH) {
+      return this.rejectMarker('label-too-long')
+    }
+
+    const marker: TakeMarker = {
+      label: text,
+      timeMs: this.currentElapsed(a),
+      order: a.markerSeq++,
+    }
+    a.markers.push(marker)
+    this.callbacks.onMarker?.(marker)
+    return { ok: true, marker }
+  }
+
+  /** 当前活动会话已写入的标记（停止冻结前的实时镜像，按创建次序）；无会话为 [] */
+  getLiveMarkers(): readonly TakeMarker[] {
+    return this.active ? [...this.active.markers] : MARKERS_EMPTY
   }
 
   /**
@@ -582,6 +701,21 @@ export class CaptureRecorder {
     return a.accumulatedMs + (this.deps.now() - a.startedAt)
   }
 
+  private rejectMarker(reason: MarkerRejectCode): AddMarkerResult {
+    return { ok: false, reason, message: MARKER_REJECT_MESSAGE[reason] }
+  }
+
+  /**
+   * 停止落定时冻结标记：按停止冻结的有效时长裁剪——
+   * 用户停止超时（兜底收尾）或设备中断时，有效时长冻结在请求停止/中断
+   * 时刻，晚于该时刻的标记理论上不可能写入（停止后已被状态守卫挡下），
+   * 这里仍做一次防御式裁剪，保证回放跳转点永不超出成片有效时长。
+   * 冻结副本按 (timeMs, order) 升序：同毫秒严格保持创建次序。
+   */
+  private freezeMarkers(a: ActiveSession, durationMs: number): TakeMarker[] {
+    return freezeTakeMarkers(a.markers, durationMs)
+  }
+
   private handleData(a: ActiveSession, data: Blob): void {
     // stop 到达之后的陈旧 chunk 一律不并入
     if (a.finalized) return
@@ -607,6 +741,8 @@ export class CaptureRecorder {
     // 时长冻结在请求停止/中断的时刻，handleStop 无论何时被调用
     // （stop 事件晚到或兜底定时器）都不再读取时钟，封装等待不计入。
     const durationMs = a.frozenDurationMs ?? this.currentElapsed(a)
+    // 标记与时长同一冻结点：按有效时长裁剪后随成片冻结
+    const markers = this.freezeMarkers(a, durationMs)
     const reason = a.stopReason
     const mode = a.mode
     const mimeType = a.mimeType
@@ -644,6 +780,7 @@ export class CaptureRecorder {
       mode,
       blob,
       durationMs,
+      markers,
       mimeType,
       reason,
       createdAt: this.deps.now(),
@@ -685,6 +822,23 @@ export class CaptureRecorder {
 function messageOf(err: unknown): string {
   if (err instanceof Error) return err.message
   return String(err)
+}
+
+/**
+ * 停止落定时冻结瞬间标记的纯函数：
+ * - 按停止冻结的有效时长裁剪（timeMs <= durationMs 才保留），
+ *   保证回放跳转点永不越过成片有效时长；
+ * - 返回浅拷贝数组，按 (timeMs, order) 升序排列，
+ *   同一毫秒严格按创建次序；不修改入参。
+ */
+export function freezeTakeMarkers(
+  markers: readonly TakeMarker[],
+  durationMs: number,
+): TakeMarker[] {
+  return markers
+    .filter((m) => m.timeMs <= durationMs)
+    .map((m) => ({ ...m }))
+    .sort((a, b) => a.timeMs - b.timeMs || a.order - b.order)
 }
 
 /** DOMException 在部分环境（jsdom）不继承 Error，需防御式读取 name */

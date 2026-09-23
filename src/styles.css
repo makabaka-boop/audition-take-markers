@@ -284,6 +284,138 @@ select:disabled {
   line-height: 1.5;
 }
 
+.marker-panel {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.marker-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.marker-input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.marker-input:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.btn-marker {
+  padding: 8px 14px;
+  border-color: var(--accent);
+  color: #8fb6ff;
+  white-space: nowrap;
+}
+
+.marker-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+.marker-hint-blocked {
+  color: var(--warn);
+}
+
+.marker-feedback {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.marker-feedback-ok {
+  color: var(--ok);
+}
+
+.marker-feedback-error {
+  color: #ffb4b0;
+}
+
+.marker-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.marker-list-live {
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.marker-chip {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.marker-chip:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.marker-live-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px;
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.marker-time {
+  font-variant-numeric: tabular-nums;
+  color: var(--accent);
+  white-space: nowrap;
+}
+
+.marker-chip .marker-label,
+.marker-live-chip .marker-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.take-markers {
+  border-top: 1px solid var(--border);
+  padding: 8px 10px 10px;
+}
+
+.markers-title {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
 .takes {
   margin-top: 28px;
 }
